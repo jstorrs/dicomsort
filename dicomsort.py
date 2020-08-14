@@ -62,6 +62,8 @@ class DICOMSorter(object):
                 '--forceDelete': 'forceDelete',
                 '-k': 'keepGoing',
                 '--keepGoing': 'keepGoing',
+                '-s': 'symlink',
+                '--symlink': 'symlink',
                 '-t': 'test',
                 '--test': 'test',
                 '-u': 'unsafe',
@@ -78,6 +80,7 @@ class DICOMSorter(object):
                 'forceDelete': False,
                 'keepGoing': False,
                 'verbose': False,
+                'symlink': False,
                 'test': False,
                 'unsafe': False,
                 'truncateTime': False
@@ -135,7 +138,12 @@ class DICOMSorter(object):
               if key.endswith("Time") and str(value)[str(value).find('.')+1:] == '000000':
                 value = str(value)[:str(value).find('.')]
             if safe:
-              replacements[key] = self.safeFileName(str(value))
+              try:
+                replacements[key] = self.safeFileName(str(value))
+              except UnicodeEncodeError as why:
+                print('Encoding target path segment value failed. Exception: %s' % why)
+                value = "Unknown_%s_" % key
+                replacements[key] = self.safeFileName(str(value))
             else:
               replacements[key] = str(value)
         return fmt % replacements
@@ -181,10 +189,16 @@ class DICOMSorter(object):
             print("Preparing the list of files ...")
 
         allFiles = []
-        for root, subFolders, files in os.walk(self.options['sourceDir']):
-            for file in files:
-                file = os.path.join(root,file)
-                allFiles.append(file)
+        if self.options['sourceDir'] == "":
+            for line in sys.stdin:
+                line = line.strip()
+                if os.path.isfile(line):
+                    allFiles.append(line.strip())
+        else:
+            for root, subFolders, files in os.walk(self.options['sourceDir']):
+                for file in files:
+                    file = os.path.join(root,file)
+                    allFiles.append(file)
 
         if self.options['verbose']:
             print("Sorting files ...")
@@ -216,11 +230,15 @@ class DICOMSorter(object):
         # check for dicom file
         try:
             ds = dicom.read_file(file,stop_before_pixels=True)
+        except (IOError, os.error) as why:
+            print( "dicom.read_file() IO error on file %s, exception %s" % (file,str(why)) )
+            return False
         except InvalidDicomError:
             return False
         except KeyError:
             # needed for issue with pydicom 0.9.9 and some dicomdir files
             return False
+
         # check for valid path - abort program to avoid overwrite
         path = self.pathFromDatasetPattern(ds, safe=(not sorter.options['unsafe']))
         if os.path.exists(path):
@@ -230,14 +248,28 @@ class DICOMSorter(object):
             if not self.options['keepGoing']:
                 print('Aborting to avoid data loss.')
                 sys.exit(-3)
+
         # make new directories to hold file if needed
         targetDir = os.path.dirname(path)
         targetFileName = os.path.basename(path)
         if not os.path.exists(targetDir):
             os.makedirs(targetDir)
-        shutil.copyfile(file,path)
-        if self.options['verbose']:
-            print("Copied %s, to %s" % (file,path))
+
+        try:
+            if self.options['symlink']:
+                os.symlink(file, path)
+                if self.options['verbose']:
+                    print("Symlinked %s, to %s" % (file,path))
+            else:
+                shutil.copyfile(file,path)
+                if self.options['verbose']:
+                    print("Copied %s, to %s" % (file,path))
+        except (IOError, os.error) as why:
+            print( "Dicom file copy/symlink IO error on output pathname >%s< Exception >%s<" % (path,str(why)) ) 
+            if self.options['deleteSource'] or self.options['forceDelete']:
+                print ("Halting execution on IO error because delteSource or forceDelete options could cause data loss.")
+                sys.exit(1)
+
         # keep track of files and new directories
         if targetDir in self.renamedFiles:
             self.renamedFiles[targetDir].append(targetFileName)
@@ -321,25 +353,47 @@ class DownloadHelper(object):
 # {{{ main, test, and arg parse
 
 def usage():
-    print("dicomsort [options...] sourceDir targetDir/<patterns>")
-    print("\n where [options...] can be:")
-    print("    [-z,--compressTargets] - create a .zip file in the target directory")
-    print("    [-d,--deleteSource] - remove source files/directories after sorting")
-    print("    [-f,--forceDelete] - remove source without confirmation")
-    print("    [-k,--keepGoing] - report but ignore dupicate target files")
-    print("    [-v,--verbose] - print diagnostics while processing")
-    print("    [-t,--test] - run the built in self test (requires internet)")
-    print("    [-u,--unsafe] - do not replace unsafe characters with '_' in the path")
-    print("    [--help] - print this message")
-    print("\n <patterns...> is a string defining the output file and directory")
-    print("names based on the dicom tags in the file.")
-    print("\n Examples:")
-    print("\n  dicomsort data sorted/%PatientName/%StudyDate/%SeriesDescription-%InstanceNumber.dcm")
-    print("\n could create a folder structure like:")
-    print("\n  sorted/JohnDoe/2013-40-18/FLAIR-2.dcm")
-    print("\nIf patterns are not specified, the following default is used:")
-    print("\n %PatientName-%Modality%StudyID-%StudyDescription-%StudyDate/%SeriesNumber_%SeriesDescription-%InstanceNumber.dcm")
+    s = """
+% dicomsort.py --help
+dicomsort [options...] sourceDir targetDir/<patterns>
 
+ where [options...] can be:
+    [-z,--compressTargets] - create a .zip file in the target directory
+    [-d,--deleteSource] - remove source files/directories after sorting
+    [-f,--forceDelete] - remove source without confirmation
+    [-k,--keepGoing] - report but ignore dupicate target files
+    [-v,--verbose] - print diagnostics while processing
+    [-s,--symlink] - create a symlink to dicom files in sourceDir instead of copying them
+    [-t,--test] - run the built in self test (requires internet)
+    [-u,--unsafe] - do not replace unsafe characters with '_' in the path
+    [--help] - print this message
+
+ where sourceDir is directory to be scanned or "" (null string) to read file list from stdin
+
+ where targetDir/<patterns...> is a string defining the output file and directory
+ names based on the dicom tags in the file.
+
+If patterns are not specified, the following default is used:
+
+  %PatientName-%Modality%StudyID-%StudyDescription-%StudyDate/%SeriesNumber_%SeriesDescription-%InstanceNumber.dcm
+
+Example 1:
+
+  dicomsort data sorted/%PatientName/%StudyDate/%SeriesDescription-%InstanceNumber.dcm
+
+  could create a folder structure like:
+
+  sorted/JohnDoe/2013-40-18/FLAIR-2.dcm
+
+Example 2:
+
+  find DicomSourceDir/ | grep "IMA$" | dicomsort -s "" DicomTargetDir
+
+  would scan DicomSourceDir for file pathnames ending in IMA and create an
+  output directory DicomTargetDir. The folder structure will be created using
+  the default pattern with symbolic links to the source dicom data files.
+"""
+    print(s)
 
 def selfTest(sorter):
     """Run a self test of the DICOMSorter
@@ -410,10 +464,14 @@ def parseArgs(sorter,args):
     if not sorter.setOptions(options):
         usage()
         sys.exit()
-    if not os.path.exists(options['sourceDir']):
+    if options['sourceDir'] == "":
+        print ("Reading file list from stdin.")
+    elif not os.path.exists(options['sourceDir']):
         print ("Source directory does not exist: %s" % options['sourceDir'])
         sys.exit(1)
-
+    if options['symlink'] and (options['compressTargets'] or options['deleteSource'] or options['forceDelete']):
+        print ("symlink option is not compatible with compressTargets, delteSource, or forceDelete options")
+        sys.exit(1)
 
 def confirmDelete(sorter):
     if sorter.options['forceDelete']:
